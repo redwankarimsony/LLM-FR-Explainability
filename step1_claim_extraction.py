@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from tqdm import tqdm
+import pandas as pd
 
 import torch
 import torch.multiprocessing as mp
@@ -109,6 +110,9 @@ def write_claims_jsonl(output_dir: Path, file_id: str, record: dict):
             "file_id":  record["file_id"],
             "status":   record["status"],
             "n_claims": record["n_claims"],
+            "image1": record["image1"],
+            "image2": record["image2"],
+            "label": record["label"],
             **({"raw_output": record["raw_output"]} if "raw_output" in record else {}),
             **({"error_message": record["error_message"]} if "error_message" in record else {}),
         }
@@ -167,7 +171,6 @@ def run_inference(model, tokenizer, text: str, device: str) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens=4000,
-            temperature=0.1,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
@@ -180,10 +183,10 @@ def run_inference(model, tokenizer, text: str, device: str) -> str:
 # Worker entry point (one per GPU)
 # Sets CUDA_VISIBLE_DEVICES BEFORE any CUDA context is touched
 # ──────────────────────────────────────────────
-def _worker_entry(gpu_id, file_paths, output_dir, model_name, batch_size):
+def _worker_entry(gpu_id, file_paths, output_dir, model_name, batch_size, df):
     """Thin wrapper: pins CUDA_VISIBLE_DEVICES before worker() touches any CUDA."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    worker(gpu_id, file_paths, output_dir, model_name, batch_size)
+    worker(gpu_id, file_paths, output_dir, model_name, batch_size, df)
 
 
 # ──────────────────────────────────────────────
@@ -195,6 +198,7 @@ def worker(
     output_dir: Path,
     model_name: str,
     batch_size: int,
+    df: pd.DataFrame,
 ):
     log = get_logger(gpu_id)
     # CUDA_VISIBLE_DEVICES must be set before any CUDA context is created.
@@ -216,6 +220,19 @@ def worker(
     stats = {"success": 0, "json_fail": 0, "error": 0, "skipped": 0}
     t0 = time.time()
 
+    
+
+    # Randomize file order for better load balancing across GPUs (optional)
+    random.shuffle(file_paths)
+
+    # Convert the pair_id column of the dataframe to the index for faster lookup
+    if df is not None and "pair_id" in df.columns:
+        df.set_index("pair_id", inplace=True)
+
+
+
+    # Remove the already rocessed files from the file_paths list to avoid redundant processing
+    file_paths = [fp for fp in file_paths if not is_already_processed(output_dir, fp.stem)]
     pbar = tqdm(
         file_paths,
         desc=f"GPU {gpu_id}",
@@ -223,8 +240,7 @@ def worker(
         dynamic_ncols=True,
     )
 
-    # Randomize file order for better load balancing across GPUs (optional)
-    random.shuffle(file_paths)
+    
 
     for i, fp in enumerate(pbar):
         file_id = fp.stem  # e.g. "explanation_00042"
@@ -239,6 +255,9 @@ def worker(
             text = fp.read_text(encoding="utf-8").strip()
             if not text:
                 raise ValueError("Empty file")
+            image1 = df.loc[file_id, "image1"] if df is not None and file_id in df.index else "unknown"
+            image2 = df.loc[file_id, "image2"] if df is not None and file_id in df.index else "unknown"
+            label = str(df.loc[file_id, "label"]) if df is not None and file_id in df.index else "unknown"
 
             raw_output = run_inference(model, tokenizer, text, device)
             claims = extract_json_array(raw_output)
@@ -252,6 +271,9 @@ def worker(
                     # "raw_output": raw_output[:500],
                     "raw_output": raw_output,
                     "n_claims":   0,
+                    "image1": image1,
+                    "image2": image2,
+                    "label": label,
                 }
                 stats["json_fail"] += 1
             else:
@@ -260,6 +282,9 @@ def worker(
                     "status":   "success",
                     "claims":   claims,
                     "n_claims": len(claims),
+                    "image1": image1,
+                    "image2": image2,
+                    "label": label,
                 }
                 stats["success"] += 1
 
@@ -271,6 +296,9 @@ def worker(
                 "claims":        [],
                 "error_message": str(e),
                 "n_claims":      0,
+                "image1": "unknown",
+                "image2": "unknown",
+                "label": "unknown",
             }
             stats["error"] += 1
 
@@ -297,8 +325,16 @@ def main():
     parser.add_argument("--gpus",       type=str, default="0",   help="Comma-separated GPU IDs, e.g. 0,1,2,3")
     parser.add_argument("--batch_size", type=int, default=4,     help="(Reserved for future batching)")
     parser.add_argument("--glob",       type=str, default="*.txt", help="File glob pattern")
+    parser.add_argument("--dataframe_path", type=str, help="Path to save the combined claims dataframe (CSV)")  
     args = parser.parse_args()
 
+    try:
+        df = pd.read_csv(args.dataframe_path)
+        print(f"Loaded dataframe with {len(df)} rows from {args.dataframe_path}")
+    except Exception as e:
+        print(f"Error loading dataframe from {args.dataframe_path}: {e}")
+        df = None
+    
     input_dir  = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -328,7 +364,7 @@ def main():
     for rank, gpu_id in enumerate(gpu_ids):
         p = mp.Process(
             target=_worker_entry,
-            args=(gpu_id, gpu_file_splits[rank], output_dir, args.model, args.batch_size),
+            args=(gpu_id, gpu_file_splits[rank], output_dir, args.model, args.batch_size, df),
         )
         p.start()
         processes.append(p)

@@ -44,6 +44,7 @@ import re
 import json
 import time
 import logging
+import random
 import argparse
 import traceback
 import itertools
@@ -159,6 +160,8 @@ def write_consistency_jsonl(output_dir: Path, pair_id: str, record: dict):
             "n_contradiction_pairs":   record.get("n_contradiction_pairs", 0),
             "n_contradictions_found":  record.get("n_contradictions_found", 0),
             "verdict_alignment":       record.get("verdict_alignment", None),
+            "image1":                 record.get("image1", None),
+            "image2":                 record.get("image2", None),
             **({"error_message": record["error_message"]}
                if "error_message" in record else {}),
         }
@@ -181,6 +184,7 @@ def load_claims(claims_dir: Path, pair_id: str) -> list:
     if not claims_path.exists():
         return []
     claims = []
+    metadata = None
     with open(claims_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             line = line.strip()
@@ -190,12 +194,14 @@ def load_claims(claims_dir: Path, pair_id: str) -> list:
                 obj = json.loads(line)
                 if i == 0:
                     if obj.get("status") != "success":
-                        return []
+                        return metadata, claims
+                    else:
+                        metadata = obj
                     continue
                 claims.append(obj)
             except Exception:
                 continue
-    return claims
+    return metadata, claims
 
 
 # ──────────────────────────────────────────────
@@ -417,6 +423,9 @@ def worker(gpu_id, rows, claims_dir, explanations_dir, output_dir, model_name):
     stats = {"success": 0, "skipped": 0, "error": 0, "missing_claims": 0}
     t0    = time.time()
 
+    # Randomize order to reduce contention if some pairs are more likely to have claims than others
+    random.shuffle(rows)
+
     for i, row in enumerate(rows):
         pair_id = str(row["pair_id"])
 
@@ -426,7 +435,7 @@ def worker(gpu_id, rows, claims_dir, explanations_dir, output_dir, model_name):
 
         try:
             # Load Step 1 claims
-            claims = load_claims(claims_dir, pair_id)
+            metadata, claims = load_claims(claims_dir, pair_id)
             if not claims:
                 log.warning(f"No claims for {pair_id}")
                 record = {
@@ -437,6 +446,8 @@ def worker(gpu_id, rows, claims_dir, explanations_dir, output_dir, model_name):
                     "verdict_alignment":     None,
                     "contradiction_results": [],
                     "verdict_result":        None,
+                    "image1":              metadata.get("image1"),
+                    "image2":              metadata.get("image2"),
                 }
                 stats["missing_claims"] += 1
                 write_consistency_jsonl(output_dir, pair_id, record)
@@ -472,6 +483,8 @@ def worker(gpu_id, rows, claims_dir, explanations_dir, output_dir, model_name):
                 "verdict_alignment":      verdict_result.get("label"),
                 "contradiction_results":  contradiction_results,
                 "verdict_result":         verdict_result,
+                "image1":                 metadata.get("image1"),
+                "image2":                 metadata.get("image2"),
             }
             stats["success"] += 1
 
@@ -486,6 +499,8 @@ def worker(gpu_id, rows, claims_dir, explanations_dir, output_dir, model_name):
                 "error_message":          str(e),
                 "contradiction_results":  [],
                 "verdict_result":         None,
+                "image1":                 metadata.get("image1"),
+                "image2":                 metadata.get("image2"), 
             }
             stats["error"] += 1
 

@@ -153,6 +153,8 @@ def write_verification_jsonl(output_dir: Path, pair_id: str, record: dict):
             "status":     record["status"],
             "n_claims":   record["n_claims"],
             "n_verified": record["n_verified"],
+            "Image1":   record["Image1"],
+            "Image2":   record["Image2"],
             **({"error_message": record["error_message"]}
                if "error_message" in record else {}),
         }
@@ -353,6 +355,8 @@ def worker(gpu_id, rows, claims_dir, image_dir, output_dir, model_name):
                     "n_claims":       0,
                     "n_verified":     0,
                     "verified_claims": [],
+                    "Image1":         str(img1_path),
+                    "Image2":         str(img2_path),
                 }
                 stats["missing_claims"] += 1
                 write_verification_jsonl(output_dir, pair_id, record)
@@ -385,6 +389,8 @@ def worker(gpu_id, rows, claims_dir, image_dir, output_dir, model_name):
                 "n_verified":      sum(1 for v in verified
                                        if v.get("visual_support") is not None),
                 "verified_claims": verified,
+                "Image1":         str(img1_path),
+                "Image2":         str(img2_path),
             }
             stats["success"] += 1
 
@@ -397,6 +403,8 @@ def worker(gpu_id, rows, claims_dir, image_dir, output_dir, model_name):
                 "n_verified":      0,
                 "error_message":   str(e),
                 "verified_claims": [],
+                "Image1":         str(img1_path),
+                "Image2":         str(img2_path),
             }
             stats["error"] += 1
 
