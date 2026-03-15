@@ -1,7 +1,8 @@
 # Custom Gitignores
 .vscode/
-.logs/
+.logs/*
 results/
+node_modules/
 
 
 # Byte-compiled / optimized / DLL files
